@@ -79,10 +79,6 @@ class PredictionOutput(BaseModel):
 def create_input_row(
     data: IncidentInput
 ) -> dict:
-    """
-    Create the raw and engineered columns expected by the
-    Spark prediction pipeline.
-    """
 
     years_since_2015 = (
         data.year - 2015
@@ -160,18 +156,12 @@ def repair_random_forest_metadata(
     spark_session: SparkSession,
     model_path: Path
 ) -> None:
-    """
-    Repair Random Forest treesMetadata.
-
-    Spark expects:
-        treeID: INT
-        metadata: STRING
-        weights: DOUBLE
-    """
 
     metadata_folders = [
         folder
-        for folder in model_path.rglob("treesMetadata")
+        for folder in model_path.rglob(
+            "treesMetadata"
+        )
         if folder.is_dir()
     ]
 
@@ -187,10 +177,13 @@ def repair_random_forest_metadata(
         metadata_df = (
             spark_session
             .read
-            .parquet(str(metadata_folder))
+            .parquet(
+                str(metadata_folder)
+            )
         )
 
         existing_columns = metadata_df.columns
+        current_types = dict(metadata_df.dtypes)
 
         print(
             "Metadata folder:",
@@ -199,18 +192,44 @@ def repair_random_forest_metadata(
         )
 
         print(
-            "Existing columns:",
+            "Existing metadata columns:",
             existing_columns,
             flush=True
         )
 
         print(
-            "Existing schema:",
-            metadata_df.dtypes,
+            "Existing metadata types:",
+            current_types,
             flush=True
         )
 
-        if existing_columns == ["_1", "_2", "_3"]:
+        expected_columns = [
+            "treeID",
+            "metadata",
+            "weights"
+        ]
+
+        expected_types = {
+            "treeID": "int",
+            "metadata": "string",
+            "weights": "double"
+        }
+
+        if (
+            existing_columns == expected_columns
+            and current_types == expected_types
+        ):
+            print(
+                "Random Forest metadata is already correct.",
+                flush=True
+            )
+            continue
+
+        if existing_columns == [
+            "_1",
+            "_2",
+            "_3"
+        ]:
 
             repaired_df = metadata_df.select(
                 F.col("_1")
@@ -226,26 +245,7 @@ def repair_random_forest_metadata(
                 .alias("weights")
             )
 
-        elif existing_columns == [
-            "treeID",
-            "metadata",
-            "weights"
-        ]:
-
-            current_types = dict(
-                metadata_df.dtypes
-            )
-
-            if (
-                current_types.get("treeID") == "int"
-                and current_types.get("metadata") == "string"
-                and current_types.get("weights") == "double"
-            ):
-                print(
-                    "Metadata schema is already correct.",
-                    flush=True
-                )
-                continue
+        elif existing_columns == expected_columns:
 
             repaired_df = metadata_df.select(
                 F.col("treeID")
@@ -262,7 +262,6 @@ def repair_random_forest_metadata(
             )
 
         else:
-
             raise RuntimeError(
                 "Unexpected Random Forest metadata columns: "
                 f"{existing_columns}"
@@ -305,125 +304,56 @@ def repair_random_forest_metadata(
             )
         )
 
-        print(
-            "Repaired schema:",
-            verification_df.dtypes,
-            flush=True
+        verification_columns = (
+            verification_df.columns
         )
 
-        expected_types = {
-            "treeID": "int",
-            "metadata": "string",
-            "weights": "double"
-        }
-
-        actual_types = dict(
+        verification_types = dict(
             verification_df.dtypes
         )
 
-        if actual_types != expected_types:
+        print(
+            "Repaired metadata columns:",
+            verification_columns,
+            flush=True
+        )
+
+        print(
+            "Repaired metadata types:",
+            verification_types,
+            flush=True
+        )
+
+        if verification_columns != expected_columns:
             raise RuntimeError(
-                "Metadata repair produced an incorrect schema. "
-                f"Actual schema: {actual_types}"
+                "Metadata repair produced incorrect columns: "
+                f"{verification_columns}"
+            )
+
+        if verification_types != expected_types:
+            raise RuntimeError(
+                "Metadata repair produced incorrect types: "
+                f"{verification_types}"
             )
 
         print(
             "Random Forest metadata repaired successfully.",
             flush=True
         )
-            continue
-
-        generic_columns = [
-            "_1",
-            "_2",
-            "_3"
-        ]
-
-        if existing_columns != generic_columns:
-            raise RuntimeError(
-                "Unexpected Random Forest metadata columns. "
-                f"Found: {existing_columns}. "
-                f"Expected either {generic_columns} "
-                f"or {expected_columns}."
-            )
-
-        temporary_folder = (
-            metadata_folder.parent
-            / "treesMetadata_repaired"
-        )
-
-        if temporary_folder.exists():
-            shutil.rmtree(
-                temporary_folder
-            )
-
-        repaired_df = metadata_df.select(
-            F.col("_1")
-            .cast("long")
-            .alias("treeID"),
-
-            F.col("_2")
-            .cast("string")
-            .alias("metadata"),
-
-            F.col("_3")
-            .cast("double")
-            .alias("weights")
-        )
-
-        (
-            repaired_df
-            .coalesce(1)
-            .write
-            .mode("overwrite")
-            .parquet(
-                str(temporary_folder)
-            )
-        )
-
-        shutil.rmtree(
-            metadata_folder
-        )
-
-        shutil.move(
-            str(temporary_folder),
-            str(metadata_folder)
-        )
-
-        verification_df = (
-            spark_session
-            .read
-            .parquet(
-                str(metadata_folder)
-            )
-        )
-
-        if (
-            verification_df.columns
-            != expected_columns
-        ):
-            raise RuntimeError(
-                "Random Forest metadata repair failed. "
-                f"Columns after repair: "
-                f"{verification_df.columns}"
-            )
-
-        print(
-            "Random Forest metadata repaired successfully:",
-            metadata_folder,
-            flush=True
-        )
 
 def load_application_metadata() -> None:
+
     global metadata
 
     if not METADATA_PATH.exists():
+        metadata = {}
+
         print(
-            "Metadata JSON was not found:",
+            "Metadata JSON not found:",
             METADATA_PATH,
             flush=True
         )
-        metadata = {}
+
         return
 
     try:
@@ -432,6 +362,7 @@ def load_application_metadata() -> None:
             "r",
             encoding="utf-8"
         ) as file:
+
             metadata = json.load(file)
 
         print(
@@ -449,6 +380,7 @@ def load_application_metadata() -> None:
         )
 
 def load_spark_model() -> None:
+
     global spark
     global model
     global model_status
@@ -481,13 +413,13 @@ def load_spark_model() -> None:
 
         if not model_metadata_folder.exists():
             raise RuntimeError(
-                "The model metadata folder is missing: "
+                "Model metadata folder is missing: "
                 f"{model_metadata_folder}"
             )
 
         if not model_stages_folder.exists():
             raise RuntimeError(
-                "The model stages folder is missing: "
+                "Model stages folder is missing: "
                 f"{model_stages_folder}"
             )
 
@@ -588,6 +520,7 @@ def load_spark_model() -> None:
 async def lifespan(
     app: FastAPI
 ):
+
     load_application_metadata()
 
     model_loading_thread = threading.Thread(
@@ -622,7 +555,7 @@ app = FastAPI(
     ),
     description=(
         "Predicts cybersecurity incident resolution time "
-        "using a PySpark Random Forest pipeline."
+        "using a PySpark Random Forest model."
     ),
     version="1.0.0",
     lifespan=lifespan
@@ -630,6 +563,7 @@ app = FastAPI(
 
 @app.get("/")
 def root() -> dict:
+
     return {
         "message": (
             "Cybersecurity Resolution Time "
@@ -645,11 +579,6 @@ def root() -> dict:
 
 @app.get("/health")
 def health() -> dict:
-    """
-    Returns HTTP 200 so Render can verify that the FastAPI
-    web server is running, while model_status separately
-    reports whether Spark finished loading.
-    """
 
     return {
         "status": "healthy",
@@ -666,6 +595,7 @@ def health() -> dict:
 
 @app.get("/metadata")
 def get_metadata() -> dict:
+
     return metadata
 
 
@@ -676,6 +606,7 @@ def get_metadata() -> dict:
 def predict(
     data: IncidentInput
 ) -> PredictionOutput:
+
     if model_status != "ready":
         raise HTTPException(
             status_code=503,
@@ -693,7 +624,7 @@ def predict(
             status_code=503,
             detail={
                 "message": (
-                    "Spark or the prediction model "
+                    "Spark or prediction model "
                     "is unavailable."
                 ),
                 "model_status": model_status,
@@ -705,8 +636,9 @@ def predict(
         input_row = create_input_row(
             data
         )
-        
+
         with prediction_lock:
+
             input_df = spark.createDataFrame(
                 [input_row]
             )
@@ -762,8 +694,8 @@ def predict(
             }
         ) from error
 
-
 if __name__ == "__main__":
+
     import uvicorn
 
     uvicorn.run(
