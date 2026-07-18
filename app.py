@@ -1,15 +1,22 @@
 import json
 import math
 import os
+import shutil
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from pyspark.ml import PipelineModel
 from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
+os.environ.setdefault("SPARK_LOCAL_IP", "127.0.0.1")
+os.environ.setdefault("SPARK_LOCAL_HOSTNAME", "localhost")
+os.environ.setdefault("PYSPARK_PYTHON", "python")
+os.environ.setdefault("PYSPARK_DRIVER_PYTHON", "python")
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -30,26 +37,25 @@ METADATA_PATH = (
     / "model_metadata.json"
 )
 
-
-spark = None
-model = None
-metadata = {}
+spark: Optional[SparkSession] = None
+model: Optional[PipelineModel] = None
+metadata: dict = {}
 
 model_status = "not_started"
-model_error = None
+model_error: Optional[str] = None
 
-
+prediction_lock = threading.Lock()
 
 class IncidentInput(BaseModel):
-    country: str
+    country: str = Field(min_length=1)
 
     year: int = Field(
         ge=2015,
         le=2030
     )
 
-    attack_type: str
-    target_industry: str
+    attack_type: str = Field(min_length=1)
+    target_industry: str = Field(min_length=1)
 
     financial_loss_million: float = Field(
         ge=0
@@ -59,15 +65,24 @@ class IncidentInput(BaseModel):
         ge=0
     )
 
-    attack_source: str
-    vulnerability_type: str
-    defense_mechanism: str
+    attack_source: str = Field(min_length=1)
+    vulnerability_type: str = Field(min_length=1)
+    defense_mechanism: str = Field(min_length=1)
 
 
+class PredictionOutput(BaseModel):
+    predicted_resolution_hours: float
+    predicted_resolution_days: float
+    model: str
+    unit: str
 
 def create_input_row(
     data: IncidentInput
 ) -> dict:
+    """
+    Create the raw and engineered columns expected by the
+    Spark prediction pipeline.
+    """
 
     years_since_2015 = (
         data.year - 2015
@@ -82,18 +97,15 @@ def create_input_row(
     )
 
     if data.affected_users > 0:
-
         loss_per_user_usd = (
             data.financial_loss_million
             * 1_000_000
         ) / data.affected_users
-
     else:
-
         loss_per_user_usd = 0.0
 
     return {
-        "country": data.country,
+        "country": data.country.strip(),
 
         "year": int(
             data.year
@@ -103,10 +115,12 @@ def create_input_row(
             years_since_2015
         ),
 
-        "attack_type": data.attack_type,
+        "attack_type": (
+            data.attack_type.strip()
+        ),
 
         "target_industry": (
-            data.target_industry
+            data.target_industry.strip()
         ),
 
         "financial_loss_million": float(
@@ -130,42 +144,251 @@ def create_input_row(
         ),
 
         "attack_source": (
-            data.attack_source
+            data.attack_source.strip()
         ),
 
         "vulnerability_type": (
-            data.vulnerability_type
+            data.vulnerability_type.strip()
         ),
 
         "defense_mechanism": (
-            data.defense_mechanism
+            data.defense_mechanism.strip()
         )
     }
 
+def repair_random_forest_metadata(
+    spark_session: SparkSession,
+    model_path: Path
+) -> None:
+    """
+    Repairs Spark Random Forest treesMetadata parquet files
+    that were exported with generic tuple column names:
 
-def load_spark_model():
+        _1, _2, _3
 
+    Spark expects:
+
+        treeID, metadata, weights
+    """
+
+    metadata_folders = [
+        folder
+        for folder in model_path.rglob(
+            "treesMetadata"
+        )
+        if folder.is_dir()
+    ]
+
+    if not metadata_folders:
+        print(
+            "No treesMetadata folder was found. "
+            "No metadata repair was required.",
+            flush=True
+        )
+        return
+
+    for metadata_folder in metadata_folders:
+        print(
+            "Checking Random Forest metadata:",
+            metadata_folder,
+            flush=True
+        )
+
+        metadata_df = (
+            spark_session
+            .read
+            .parquet(
+                str(metadata_folder)
+            )
+        )
+
+        existing_columns = (
+            metadata_df.columns
+        )
+
+        print(
+            "Existing metadata columns:",
+            existing_columns,
+            flush=True
+        )
+
+        expected_columns = [
+            "treeID",
+            "metadata",
+            "weights"
+        ]
+
+        if existing_columns == expected_columns:
+            print(
+                "Random Forest metadata is already correct.",
+                flush=True
+            )
+            continue
+
+        generic_columns = [
+            "_1",
+            "_2",
+            "_3"
+        ]
+
+        if existing_columns != generic_columns:
+            raise RuntimeError(
+                "Unexpected Random Forest metadata columns. "
+                f"Found: {existing_columns}. "
+                f"Expected either {generic_columns} "
+                f"or {expected_columns}."
+            )
+
+        temporary_folder = (
+            metadata_folder.parent
+            / "treesMetadata_repaired"
+        )
+
+        if temporary_folder.exists():
+            shutil.rmtree(
+                temporary_folder
+            )
+
+        repaired_df = metadata_df.select(
+            F.col("_1")
+            .cast("long")
+            .alias("treeID"),
+
+            F.col("_2")
+            .cast("string")
+            .alias("metadata"),
+
+            F.col("_3")
+            .cast("double")
+            .alias("weights")
+        )
+
+        (
+            repaired_df
+            .coalesce(1)
+            .write
+            .mode("overwrite")
+            .parquet(
+                str(temporary_folder)
+            )
+        )
+
+        shutil.rmtree(
+            metadata_folder
+        )
+
+        shutil.move(
+            str(temporary_folder),
+            str(metadata_folder)
+        )
+
+        verification_df = (
+            spark_session
+            .read
+            .parquet(
+                str(metadata_folder)
+            )
+        )
+
+        if (
+            verification_df.columns
+            != expected_columns
+        ):
+            raise RuntimeError(
+                "Random Forest metadata repair failed. "
+                f"Columns after repair: "
+                f"{verification_df.columns}"
+            )
+
+        print(
+            "Random Forest metadata repaired successfully:",
+            metadata_folder,
+            flush=True
+        )
+
+def load_application_metadata() -> None:
+    global metadata
+
+    if not METADATA_PATH.exists():
+        print(
+            "Metadata JSON was not found:",
+            METADATA_PATH,
+            flush=True
+        )
+        metadata = {}
+        return
+
+    try:
+        with open(
+            METADATA_PATH,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            metadata = json.load(file)
+
+        print(
+            "Application metadata loaded successfully.",
+            flush=True
+        )
+
+    except Exception as error:
+        metadata = {}
+
+        print(
+            "Unable to load application metadata:",
+            str(error),
+            flush=True
+        )
+
+def load_spark_model() -> None:
     global spark
     global model
     global model_status
     global model_error
 
-    model_status = "loading"
+    model_status = "checking_files"
     model_error = None
 
     try:
-
         print(
-            f"Loading model from: {MODEL_PATH}",
+            "Model path:",
+            MODEL_PATH,
             flush=True
         )
 
         if not MODEL_PATH.exists():
-
             raise RuntimeError(
-                f"Model folder not found: "
-                f"{MODEL_PATH}"
+                f"Model folder not found: {MODEL_PATH}"
             )
+
+        model_metadata_folder = (
+            MODEL_PATH
+            / "metadata"
+        )
+
+        model_stages_folder = (
+            MODEL_PATH
+            / "stages"
+        )
+
+        if not model_metadata_folder.exists():
+            raise RuntimeError(
+                "The model metadata folder is missing: "
+                f"{model_metadata_folder}"
+            )
+
+        if not model_stages_folder.exists():
+            raise RuntimeError(
+                "The model stages folder is missing: "
+                f"{model_stages_folder}"
+            )
+
+        model_status = "starting_spark"
+
+        print(
+            "Starting Spark...",
+            flush=True
+        )
 
         spark = (
             SparkSession.builder
@@ -187,7 +410,10 @@ def load_spark_model():
             )
             .config(
                 "spark.driver.memory",
-                "512m"
+                os.getenv(
+                    "SPARK_DRIVER_MEMORY",
+                    "512m"
+                )
             )
             .config(
                 "spark.driver.host",
@@ -197,6 +423,10 @@ def load_spark_model():
                 "spark.driver.bindAddress",
                 "127.0.0.1"
             )
+            .config(
+                "spark.python.worker.reuse",
+                "true"
+            )
             .getOrCreate()
         )
 
@@ -205,7 +435,21 @@ def load_spark_model():
         )
 
         print(
-            "Spark started. Loading model...",
+            "Spark started successfully.",
+            flush=True
+        )
+
+        model_status = "repairing_metadata"
+
+        repair_random_forest_metadata(
+            spark_session=spark,
+            model_path=MODEL_PATH
+        )
+
+        model_status = "loading_model"
+
+        print(
+            "Loading Spark PipelineModel...",
             flush=True
         )
 
@@ -214,6 +458,7 @@ def load_spark_model():
         )
 
         model_status = "ready"
+        model_error = None
 
         print(
             "Spark model loaded successfully.",
@@ -221,73 +466,82 @@ def load_spark_model():
         )
 
     except Exception as error:
-
+        model = None
         model_status = "failed"
         model_error = str(error)
 
         print(
-            f"Model loading failed: {error}",
+            "Spark model loading failed:",
+            model_error,
             flush=True
         )
 
-
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(
+    app: FastAPI
+):
+    load_application_metadata()
 
-    global metadata
-
-    if METADATA_PATH.exists():
-
-        with open(
-            METADATA_PATH,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            metadata = json.load(file)
-
-    model_thread = threading.Thread(
+    model_loading_thread = threading.Thread(
         target=load_spark_model,
+        name="spark-model-loader",
         daemon=True
     )
 
-    model_thread.start()
+    model_loading_thread.start()
 
     yield
 
     if spark is not None:
+        try:
+            spark.stop()
 
-        spark.stop()
+            print(
+                "Spark stopped successfully.",
+                flush=True
+            )
 
+        except Exception as error:
+            print(
+                "Error while stopping Spark:",
+                str(error),
+                flush=True
+            )
 
 app = FastAPI(
     title=(
         "Cybersecurity Resolution Time API"
     ),
     description=(
-        "Predicts incident resolution time "
-        "using a Spark Random Forest pipeline."
+        "Predicts cybersecurity incident resolution time "
+        "using a PySpark Random Forest pipeline."
     ),
     version="1.0.0",
     lifespan=lifespan
 )
 
-
 @app.get("/")
-def root():
-
+def root() -> dict:
     return {
         "message": (
-            "Cybersecurity Prediction API"
+            "Cybersecurity Resolution Time "
+            "Prediction API"
         ),
-        "docs": "/docs",
-        "health": "/health",
+        "documentation": "/docs",
+        "health_check": "/health",
+        "metadata": "/metadata",
+        "prediction_endpoint": "/predict",
         "model_status": model_status
     }
 
 
 @app.get("/health")
-def health():
+def health() -> dict:
+    """
+    Returns HTTP 200 so Render can verify that the FastAPI
+    web server is running, while model_status separately
+    reports whether Spark finished loading.
+    """
 
     return {
         "status": "healthy",
@@ -303,18 +557,18 @@ def health():
 
 
 @app.get("/metadata")
-def get_metadata():
-
+def get_metadata() -> dict:
     return metadata
 
 
-@app.post("/predict")
+@app.post(
+    "/predict",
+    response_model=PredictionOutput
+)
 def predict(
     data: IncidentInput
-):
-
+) -> PredictionOutput:
     if model_status != "ready":
-
         raise HTTPException(
             status_code=503,
             detail={
@@ -326,21 +580,40 @@ def predict(
             }
         )
 
-    try:
+    if spark is None or model is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": (
+                    "Spark or the prediction model "
+                    "is unavailable."
+                ),
+                "model_status": model_status,
+                "model_error": model_error
+            }
+        )
 
+    try:
         input_row = create_input_row(
             data
         )
+        
+        with prediction_lock:
+            input_df = spark.createDataFrame(
+                [input_row]
+            )
 
-        input_df = spark.createDataFrame(
-            [input_row]
-        )
+            prediction_row = (
+                model
+                .transform(input_df)
+                .select("prediction")
+                .first()
+            )
 
-        prediction_row = (
-            model.transform(input_df)
-            .select("prediction")
-            .first()
-        )
+        if prediction_row is None:
+            raise RuntimeError(
+                "The model did not return a prediction."
+            )
 
         predicted_hours = max(
             0.0,
@@ -351,33 +624,38 @@ def predict(
             )
         )
 
-        return {
-            "predicted_resolution_hours": round(
+        return PredictionOutput(
+            predicted_resolution_hours=round(
                 predicted_hours,
                 2
             ),
 
-            "predicted_resolution_days": round(
+            predicted_resolution_days=round(
                 predicted_hours / 24,
                 2
             ),
 
-            "model": "Random Forest",
-            "unit": "hours"
-        }
+            model="Random Forest",
+
+            unit="hours"
+        )
+
+    except HTTPException:
+        raise
 
     except Exception as error:
-
         raise HTTPException(
             status_code=500,
-            detail=(
-                f"Prediction failed: "
-                f"{str(error)}"
-            )
+            detail={
+                "message": (
+                    "Prediction failed."
+                ),
+                "error": str(error)
+            }
         ) from error
 
-if __name__ == "__main__":
 
+if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
@@ -386,7 +664,7 @@ if __name__ == "__main__":
         port=int(
             os.getenv(
                 "PORT",
-                8000
+                "8000"
             )
         ),
         reload=False
