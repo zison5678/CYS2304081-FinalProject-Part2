@@ -21,4 +21,13 @@ RUN python -m pip install --upgrade pip && \
 
 COPY . .
 
+RUN python -m zipfile -e data.zip /app && \
+    python -m zipfile -e model.zip /app
+
+RUN test -f /app/data/cleaned_incidents.csv && \
+    test -f /app/data/clustered_incidents.csv && \
+    test -f /app/data/cluster_profiles.csv && \
+    test -d /app/model/resolution_time_rf_pipeline_model/metadata && \
+    test -d /app/model/resolution_time_rf_pipeline_model/stages
+
 CMD ["sh", "-c", "python -m uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000}"]
