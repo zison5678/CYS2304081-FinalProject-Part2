@@ -161,40 +161,143 @@ def repair_random_forest_metadata(
     model_path: Path
 ) -> None:
     """
-    Repairs Spark Random Forest treesMetadata parquet files
-    that were exported with generic tuple column names:
-
-        _1, _2, _3
+    Repair Random Forest treesMetadata.
 
     Spark expects:
-
-        treeID, metadata, weights
+        treeID: INT
+        metadata: STRING
+        weights: DOUBLE
     """
 
     metadata_folders = [
         folder
-        for folder in model_path.rglob(
-            "treesMetadata"
-        )
+        for folder in model_path.rglob("treesMetadata")
         if folder.is_dir()
     ]
 
     if not metadata_folders:
         print(
-            "No treesMetadata folder was found. "
-            "No metadata repair was required.",
+            "No treesMetadata folder found.",
             flush=True
         )
         return
 
     for metadata_folder in metadata_folders:
+
+        metadata_df = (
+            spark_session
+            .read
+            .parquet(str(metadata_folder))
+        )
+
+        existing_columns = metadata_df.columns
+
         print(
-            "Checking Random Forest metadata:",
+            "Metadata folder:",
             metadata_folder,
             flush=True
         )
 
-        metadata_df = (
+        print(
+            "Existing columns:",
+            existing_columns,
+            flush=True
+        )
+
+        print(
+            "Existing schema:",
+            metadata_df.dtypes,
+            flush=True
+        )
+
+        if existing_columns == ["_1", "_2", "_3"]:
+
+            repaired_df = metadata_df.select(
+                F.col("_1")
+                .cast("int")
+                .alias("treeID"),
+
+                F.col("_2")
+                .cast("string")
+                .alias("metadata"),
+
+                F.col("_3")
+                .cast("double")
+                .alias("weights")
+            )
+
+        elif existing_columns == [
+            "treeID",
+            "metadata",
+            "weights"
+        ]:
+
+            current_types = dict(
+                metadata_df.dtypes
+            )
+
+            if (
+                current_types.get("treeID") == "int"
+                and current_types.get("metadata") == "string"
+                and current_types.get("weights") == "double"
+            ):
+                print(
+                    "Metadata schema is already correct.",
+                    flush=True
+                )
+                continue
+
+            repaired_df = metadata_df.select(
+                F.col("treeID")
+                .cast("int")
+                .alias("treeID"),
+
+                F.col("metadata")
+                .cast("string")
+                .alias("metadata"),
+
+                F.col("weights")
+                .cast("double")
+                .alias("weights")
+            )
+
+        else:
+
+            raise RuntimeError(
+                "Unexpected Random Forest metadata columns: "
+                f"{existing_columns}"
+            )
+
+        temporary_folder = (
+            metadata_folder.parent
+            / "treesMetadata_repaired"
+        )
+
+        if temporary_folder.exists():
+            shutil.rmtree(
+                temporary_folder
+            )
+
+        (
+            repaired_df
+            .coalesce(1)
+            .write
+            .mode("overwrite")
+            .parquet(
+                str(temporary_folder)
+            )
+        )
+
+        shutil.rmtree(
+            metadata_folder
+        )
+
+        shutil.move(
+            str(temporary_folder),
+            str(metadata_folder)
+        )
+
+        verification_df = (
             spark_session
             .read
             .parquet(
@@ -202,27 +305,32 @@ def repair_random_forest_metadata(
             )
         )
 
-        existing_columns = (
-            metadata_df.columns
-        )
-
         print(
-            "Existing metadata columns:",
-            existing_columns,
+            "Repaired schema:",
+            verification_df.dtypes,
             flush=True
         )
 
-        expected_columns = [
-            "treeID",
-            "metadata",
-            "weights"
-        ]
+        expected_types = {
+            "treeID": "int",
+            "metadata": "string",
+            "weights": "double"
+        }
 
-        if existing_columns == expected_columns:
-            print(
-                "Random Forest metadata is already correct.",
-                flush=True
+        actual_types = dict(
+            verification_df.dtypes
+        )
+
+        if actual_types != expected_types:
+            raise RuntimeError(
+                "Metadata repair produced an incorrect schema. "
+                f"Actual schema: {actual_types}"
             )
+
+        print(
+            "Random Forest metadata repaired successfully.",
+            flush=True
+        )
             continue
 
         generic_columns = [
