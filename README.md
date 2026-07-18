@@ -19,3 +19,39 @@ The main prediction endpoint is:
 
 ```text
 POST /predict
+
+```
+
+## Running the Streamlit Application
+
+### 1. Install the required packages
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Configure the FastAPI URL
+
+Create the file:
+
+```text
+.streamlit/secrets.toml
+```
+
+Add:
+
+```toml
+API_URL = "https://cybersecurity-resolution-api-mgvw.onrender.com"
+```
+
+### 3. Run Streamlit
+
+```bash
+streamlit run streamlit_app.py
+```
+
+The Streamlit application will normally open at:
+
+```text
+http://localhost:8501
+```
