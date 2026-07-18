@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: cybersecurity-resolution-api
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
